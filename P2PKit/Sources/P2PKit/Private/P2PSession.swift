@@ -7,18 +7,37 @@
 
 import MultipeerConnectivity
 
-// MARK: - P2PSession
-
+// MARK: - P2PSessionDelegate 프로토콜 정의
+/// P2P 세션에서 발생하는 이벤트를 델리게이트 객체에게 전달하기 위한 프로토콜입니다.
+/// 연결 상태 업데이트, 데이터 수신, 연결 수락 여부를 앱 외부 로직으로 위임하여 처리할 수 있도록 합니다.
 protocol P2PSessionDelegate: AnyObject {
+    /// 연결된 피어의 상태가 변경될 때 호출됩니다.
+    /// - Parameters:
+    ///   - session: 연결 세션 인스턴스
+    ///   - peer: 연결 상태가 변경된 피어
     func p2pSession(_ session: P2PSession, didUpdate peer: Peer) -> Void
+    /// 피어로부터 데이터를 수신했을 때 호출됩니다.
+    /// - Parameters:
+    ///   - session: 연결 세션 인스턴스
+    ///   - data: 수신된 원본 데이터
+    ///   - json: 수신된 데이터의 JSON 표현 (가능한 경우)
+    ///   - peerID: 데이터를 보낸 피어의 ID
     func p2pSession(_ session: P2PSession, didReceive data: Data, dataAsJson json: [String: Any]?, from peerID: MCPeerID)
+    /// 새 피어의 연결 요청을 수락할지 여부를 결정합니다.
+    /// - Parameters:
+    ///   - session: 연결 세션 인스턴스
+    ///   - peerID: 연결을 요청한 피어의 ID
+    /// - Returns: 연결을 수락할 경우 true, 거절할 경우 false
+    func p2pSession(_ session: P2PSession, shouldAccept peerID: MCPeerID) -> Bool
 }
+
 
 class P2PSession: NSObject {
     weak var delegate: P2PSessionDelegate?
     
     let myPeer: Peer
     private let myDiscoveryInfo: DiscoveryInfo
+    private let maxPeerCount: Int
     
     private let session: MCSession
     private let advertiser: MCNearbyServiceAdvertiser
@@ -30,6 +49,7 @@ class P2PSession: NSObject {
     private var sessionStates = [MCPeerID: MCSessionState]() // protected with peersLock
     private var invitesHistory = [MCPeerID: InviteHistory]() // protected with peersLock
     private var loopbackTestTimers = [MCPeerID: Timer]() // protected with peersLock
+    
     
     var connectedPeers: [Peer] {
         peersLock.lock(); defer { peersLock.unlock() }
@@ -56,19 +76,32 @@ class P2PSession: NSObject {
         return Peer(peerID, id: discoverID)
     }
     
-    init(myPeer: Peer) {
-        self.myPeer = myPeer
-        self.myDiscoveryInfo = DiscoveryInfo(discoveryId: myPeer.id)
-        discoveryInfos[myPeer.peerID] = self.myDiscoveryInfo
-        let myPeerID = myPeer.peerID
+    /// P2PSession의 초기화 함수입니다.
+    /// - Parameters:
+    ///   - myPeer: 자신을 나타내는 Peer 객체
+    ///   - maxPeerCount: 연결 가능한 최대 피어 수 (기본값은 4명)
+    init(myPeer: Peer, maxPeerCount: Int = 4) {
+        self.myPeer = myPeer  // 자신의 피어 정보를 저장
+        self.myDiscoveryInfo = DiscoveryInfo(discoveryId: myPeer.id)  // 자신의 discovery ID 설정
+        self.maxPeerCount = maxPeerCount  // 최대 연결 가능한 피어 수 저장
+        discoveryInfos[myPeer.peerID] = self.myDiscoveryInfo  // 자신의 discovery 정보 등록
+        
+        let myPeerID = myPeer.peerID  // MultipeerConnectivity에서 사용할 PeerID 생성
+        
+        // 보안을 적용한 MCSession 인스턴스 생성
         session = MCSession(peer: myPeerID, securityIdentity: nil, encryptionPreference: .required)
+        
+        // 주변 피어에게 광고를 시작할 Advertiser 생성 (discovery 정보 포함)
         advertiser = MCNearbyServiceAdvertiser(peer: myPeerID,
                                                discoveryInfo: ["discoveryId": "\(myDiscoveryInfo.discoveryId)"],
                                                serviceType: P2PConstants.networkChannelName)
+        
+        // 주변 피어를 검색할 Browser 생성
         browser = MCNearbyServiceBrowser(peer: myPeerID, serviceType: P2PConstants.networkChannelName)
         
-        super.init()
+        super.init()  // NSObject 초기화
         
+        // 세션, 광고자, 브라우저에 대한 델리게이트 설정
         session.delegate = self
         advertiser.delegate = self
         browser.delegate = self
@@ -282,25 +315,39 @@ extension P2PSession: MCNearbyServiceBrowserDelegate {
     }
 }
 
-// MARK: - Advertiser Delegate
+// MARK: - MCNearbyServiceAdvertiserDelegate
 
 extension P2PSession: MCNearbyServiceAdvertiserDelegate {
-    func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didReceiveInvitationFromPeer peerID: MCPeerID, withContext context: Data?, invitationHandler: @escaping (Bool, MCSession?) -> Void) {
-        if isNotConnected(peerID) {
+    
+    /// 연결 요청을 받았을 때 호출됨. 현재 연결된 피어 수가 최대 허용 수를 초과하지 않고,
+    /// delegate가 수락을 허용하는 경우에만 초대 수락.
+    func advertiser(_ advertiser: MCNearbyServiceAdvertiser,
+                    didReceiveInvitationFromPeer peerID: MCPeerID,
+                    withContext context: Data?,
+                    invitationHandler: @escaping (Bool, MCSession?) -> Void) {
+        let currentConnectedCount = session.connectedPeers.count
+        if isNotConnected(peerID),
+           currentConnectedCount < maxPeerCount,
+           delegate?.p2pSession(self, shouldAccept: peerID) == true {
             prettyPrint("Accepting Peer invite from [\(peerID.displayName)]")
             invitationHandler(true, self.session)
+        } else {
+            prettyPrint("Rejecting Peer invite from [\(peerID.displayName)] due to capacity limit.")
+            invitationHandler(false, nil)
         }
     }
     
-    func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) {
-        prettyPrint(level:.error, "Error: \(error.localizedDescription)")
+    /// advertising 시작 실패 시 호출됨. 네트워크 오류 등의 정보를 출력함.
+    func advertiser(_ advertiser: MCNearbyServiceAdvertiser,
+                    didNotStartAdvertisingPeer error: Error) {
+        prettyPrint(level: .error, "Error: \(error.localizedDescription)")
     }
 }
 
-// MARK: - Private - Invite Peers
+// MARK: - 피어 초대 관련 (Invite Peers)
 
 extension P2PSession {
-    // Call this from inside a peerLock()
+    // 이 함수는 peersLock() 내부에서 호출되어야 합니다.
     private func invitePeerIfNeeded(_ peerID: MCPeerID) {
         func invitePeer(attempt: Int) {
             prettyPrint("Inviting peer: [\(peerID.displayName)]. Attempt \(attempt)")
@@ -308,24 +355,24 @@ extension P2PSession {
             invitesHistory[peerID] = InviteHistory(attempt: attempt, nextInviteAfter: Date().addingTimeInterval(retryWaitTime))
         }
         
-        // Between any pair of devices, only one invites.
+        // 두 장치 간에는 한쪽만 초대를 보냅니다.
         guard let otherDiscoverID = discoveryInfos[peerID]?.discoveryId,
               myDiscoveryInfo.discoveryId < otherDiscoverID,
               isNotConnected(peerID) else {
             return
         }
         
-        let retryWaitTime: TimeInterval = 3 // time to wait before retrying invite
-        let maxRetries = 3
-        let inviteTimeout: TimeInterval = 8 // time before retrying times out
+        let retryWaitTime: TimeInterval = 3 // 초대 재시도까지 기다리는 시간
+        let maxRetries = 3 // 최대 재시도 횟수
+        let inviteTimeout: TimeInterval = 8 // 초대 타임아웃 시간
         
         if let prevInvite = invitesHistory[peerID] {
             if prevInvite.nextInviteAfter.timeIntervalSinceNow < -(inviteTimeout + 3) {
-                // Waited long enough that we can restart attempt from 1.
+                // 충분히 기다렸다면 1번째 시도부터 다시 시작합니다.
                 invitePeer(attempt: 1)
                 
             } else if prevInvite.nextInviteAfter.timeIntervalSinceNow < 0 {
-                // Waited long enough to do the next invite attempt.
+                // 충분히 기다렸으므로 다음 초대 시도를 진행합니다.
                 if prevInvite.attempt < maxRetries {
                     invitePeer(attempt: prevInvite.attempt + 1)
                 } else {
@@ -335,7 +382,7 @@ extension P2PSession {
                 
             } else {
                 if !prevInvite.nextInviteScheduled {
-                    // Haven't waited long enough for next invite, so schedule the next invite.
+                    // 다음 초대를 시도하기엔 아직 이르므로 예약합니다.
                     prettyPrint("Inviting peer later: [\(peerID.displayName)] with attempt \(prevInvite.attempt + 1)")
                     
                     DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + retryWaitTime + 0.1) { [weak self] in
@@ -347,6 +394,7 @@ extension P2PSession {
                     }
                     invitesHistory[peerID]?.nextInviteScheduled = true
                 } else {
+                    // 피어 [\(peerID.displayName)]에게 초대할 필요 없음. 다음 초대는 이미 예약되어 있음.
                     prettyPrint("No need to invite peer [\(peerID.displayName)]. Next invite is already scheduled.")
                 }
             }
@@ -356,12 +404,24 @@ extension P2PSession {
     }
     
     private func isNotConnected(_ peerID: MCPeerID) -> Bool {
+        // 연결되지 않은 상태인지 확인하는 유틸리티 함수
         return !session.connectedPeers.contains(peerID)
         && sessionStates[peerID] != .connecting
         && sessionStates[peerID] != .connected
     }
 }
 
+// MARK: - P2PSessionDelegate 기본 구현
+/// 피어 연결 요청을 수락할지 여부를 판단하는 기본 구현.
+/// 기본값은 true이며, 모든 연결 요청을 수락합니다.
+extension P2PSessionDelegate {
+    func p2pSession(_ session: P2PSession, shouldAccept peerID: MCPeerID) -> Bool {
+        return true
+    }
+}
+
+/// 초대 재시도를 위한 상태 저장 구조체.
+/// 시도 횟수, 다음 초대 시각, 예약 여부를 포함합니다.
 private struct InviteHistory {
     let attempt: Int
     let nextInviteAfter: Date

@@ -9,12 +9,12 @@ import Foundation
 import MultipeerConnectivity
 
 public struct P2PConstants {
-    public static var networkChannelName = "my-p2p-service"
+    public static var networkChannelName = "mygame-p2p"  // 모든 디바이스에서 동일하게 유지
     public static var loggerEnabled = true
     
     struct UserDefaultsKeys {
-        static let myMCPeerID = "com.P2PKit.MyMCPeerIDKey"
-        static let myPeerID = "com.P2PKit.MyPeerIDKey"
+        static let myMCPeerID = "com.MyApp.MyMCPeerIDKey"
+        static let myPeerID = "com.MyApp.MyPeerIDKey"
     }
 }
 
